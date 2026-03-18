@@ -1,0 +1,19 @@
+{
+  "name": "jclaw",
+  "version": "1.0.0",
+  "description": "LINE-native AI Agent powered by local LLM via Ollama",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "author": "iHouse Japan",
+  "license": "MIT",
+  "dependencies": {
+    "@line/bot-sdk": "^9.7.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2"
+  }
+}
