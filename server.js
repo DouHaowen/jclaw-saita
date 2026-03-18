@@ -1,7 +1,8 @@
 /**
- * JClaw - LINE-native AI Agent powered by local LLM
- * Japan's first LINE Official SDK + Ollama + SearXNG integration
- * Free web search via self-hosted SearXNG (no API key needed)
+ * JClaw v2.0 - LINE-native AI Agent powered by local LLM
+ * Japan's first LINE Official SDK + Ollama + SearXNG + memclawz integration
+ * Features: Web search, Tier S memory (causality graph, 2.7x better than Mem0)
+ * Zero API cost — 100% self-hosted
  * © iHouse Japan - MIT License
  * https://github.com/iHouse-japan/jclaw
  */
@@ -23,6 +24,7 @@ const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
 const PORT = process.env.PORT || 3001;
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8899';
+const MEMCLAWZ_URL = process.env.MEMCLAWZ_URL || 'http://localhost:3500';
 
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   'あなたはJClawです。LINE上で動作するAIアシスタントです。日本語・英語・中国語で丁寧に対応してください。簡潔で実用的な回答を心がけてください。Web検索結果が提供された場合は、その情報を元に正確に回答してください。';
@@ -74,6 +76,42 @@ function extractSearchQuery(text) {
 const conversations = new Map();
 const MAX_HISTORY = 20;
 
+// --- Long-term Memory (memclawz) ---
+async function memorySearch(query, userId) {
+  try {
+    const url = MEMCLAWZ_URL + '/api/v1/search?q=' + encodeURIComponent(query) + '&agent_id=jclaw&user_id=' + encodeURIComponent(userId) + '&limit=5';
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const results = data.results || [];
+    if (!results.length) return null;
+    const memories = results.map((r, i) => {
+      const content = r.payload?.memory || r.memory || '';
+      const type = r.payload?.memory_type || 'unknown';
+      return '[Memory ' + (i+1) + ' (' + type + ')] ' + content;
+    });
+    console.log('[Memory] Found ' + memories.length + ' memories for: ' + query.substring(0, 40));
+    return memories.join('\n');
+  } catch (e) {
+    console.error('[Memory Search Error]', e.message);
+    return null;
+  }
+}
+
+async function memorySave(content, userId, memoryType = 'fact') {
+  try {
+    const res = await fetch(MEMCLAWZ_URL + '/api/v1/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, user_id: userId, agent_id: 'jclaw', memory_type: memoryType }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) console.log('[Memory] Saved: ' + content.substring(0, 50) + '...');
+  } catch (e) {
+    console.error('[Memory Save Error]', e.message);
+  }
+}
+
 function getHistory(userId) {
   if (!conversations.has(userId)) conversations.set(userId, []);
   return conversations.get(userId);
@@ -90,6 +128,12 @@ async function chatWithOllama(userId, userMessage) {
   addToHistory(userId, 'user', userMessage);
 
   let systemContent = SYSTEM_PROMPT;
+
+  // Long-term memory recall
+  const memories = await memorySearch(userMessage, userId);
+  if (memories) {
+    systemContent += '\n\n[Long-term Memory — things you remember about this user]\n' + memories + '\n\nUse this memory naturally in your response. Do not say "according to my memory" — just use the information as if you know it.';
+  }
 
   // Auto web search if keywords detected
   if (needsSearch(userMessage)) {
@@ -129,6 +173,9 @@ async function chatWithOllama(userId, userMessage) {
     reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
     addToHistory(userId, 'assistant', reply);
 
+    // Save conversation to long-term memory (async, non-blocking)
+    memorySave('User: ' + userMessage + '\nAssistant: ' + reply.substring(0, 500), userId, 'event').catch(() => {});
+
     if (data.eval_count && data.eval_duration) {
       const tps = (data.eval_count / (data.eval_duration / 1e9)).toFixed(1);
       console.log('[' + OLLAMA_MODEL + '] ' + data.eval_count + ' tokens @ ' + tps + ' t/s');
@@ -166,7 +213,8 @@ async function handleEvent(event) {
       + 'Model: ' + OLLAMA_MODEL + '\n'
       + 'Ollama: ' + OLLAMA_HOST + '\n'
       + 'History: ' + history.length + '/' + MAX_HISTORY + ' turns\n'
-      + '🔍 Web Search: ON (SearXNG self-hosted)\n\n'
+      + '🔍 Web Search: ON (SearXNG self-hosted)\n'
+      + '🧠 Memory: ON (memclawz v9.1)\n\n'
       + 'Commands:\n'
       + '/search <query> - Web検索\n'
       + '/検索 <キーワード> - Web検索\n'
@@ -183,8 +231,10 @@ async function handleEvent(event) {
   if (userText === '/help' || userText === '/ヘルプ') {
     return client.replyMessage({
       replyToken: event.replyToken,
-      messages: [{ type: 'text', text: '🐾 JClaw ヘルプ\n\n'
+      messages: [{ type: 'text', text: '🐾 JClaw v2.0 ヘルプ\n\n'
         + '普通に話しかけてください。AIが回答します。\n\n'
+        + '🧠 記憶機能:\n'
+        + 'あなたとの会話を記憶します。名前・好み・過去の話題を覚えています。\n\n'
         + '🔍 検索機能:\n'
         + '「最新」「今日」「ニュース」等のキーワードで自動Web検索します。\n'
         + '/search 東京の天気 — 直接検索\n\n'
@@ -219,6 +269,7 @@ app.get('/health', (req, res) => {
     status: 'ok', model: OLLAMA_MODEL, ollama: OLLAMA_HOST,
     uptime: process.uptime(), conversations: conversations.size,
     webSearch: 'enabled (SearXNG self-hosted, free, unlimited)',
+    memory: 'enabled (memclawz v9.1, Qdrant + Neo4j)',
   });
 });
 
@@ -245,9 +296,10 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log('='.repeat(50));
-  console.log('🐾 JClaw is running on port ' + PORT);
+  console.log('🐾 JClaw v2.0 is running on port ' + PORT);
   console.log('🦙 Ollama: ' + OLLAMA_HOST + ' (' + OLLAMA_MODEL + ')');
   console.log('🔍 Web Search: SearXNG (self-hosted, free, unlimited)');
+  console.log('🧠 Memory: memclawz v9.1 (Qdrant + Neo4j, zero API cost)');
   console.log('📡 Webhook: http://localhost:' + PORT + '/webhook');
   console.log('='.repeat(50));
 });
