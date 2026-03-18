@@ -1,0 +1,13 @@
+# JClaw + SearXNG docker-compose
+# Usage: docker compose up -d searxng
+# (JClaw itself runs via npm start, not Docker)
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: jclaw-searxng
+    ports:
+      - "8899:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    restart: unless-stopped

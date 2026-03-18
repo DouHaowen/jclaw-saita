@@ -37,7 +37,8 @@ Built and maintained by [iHouse Japan](https://github.com/iHouse-japan).
 | 📦 **Data Fully Local** | All conversation data stored and processed on-premises |
 | ⚡ **Lightweight & Fast** | Minimal stack — Node.js + Express + Ollama |
 | 💬 **Conversation Memory** | Per-user chat history maintained across messages |
-| 🔄 **Special Commands** | `/reset` to clear history, `/status` to check system |
+| 🔍 **Web Search (SearXNG)** | Free, unlimited web search via self-hosted SearXNG — no API key needed |
+| 🔄 **Special Commands** | `/reset` `/status` `/help` `/search <query>` `/検索` `/搜索` |
 
 ---
 
@@ -48,6 +49,7 @@ Built and maintained by [iHouse Japan](https://github.com/iHouse-japan).
 - Node.js 20+
 - [Ollama](https://ollama.ai) installed and running
 - `qwen3:14b` model pulled (`ollama pull qwen3:14b`)
+- [Docker](https://docker.com) (for SearXNG web search)
 - LINE Developer account + Messaging API channel
 - A public HTTPS endpoint (e.g. ngrok for dev, VPS for production)
 
@@ -59,6 +61,11 @@ cd jclaw
 npm install
 cp .env.example .env
 # Fill in LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
+
+# Start SearXNG (free web search engine)
+docker compose up -d searxng
+
+# Start JClaw
 npm start
 ```
 
@@ -73,6 +80,26 @@ npm start
 | `OLLAMA_HOST` | Ollama API base URL | `http://localhost:11434` |
 | `OLLAMA_MODEL` | Model to use | `qwen3:14b` |
 | `PORT` | Server port | `3001` |
+| `SEARXNG_URL` | SearXNG search URL | `http://localhost:8899` |
+| `SYSTEM_PROMPT` | Custom AI personality | `あなたは...` |
+
+---
+
+### 🔍 Web Search (v1.1)
+
+JClaw automatically searches the web when it detects keywords like:
+- 🇯🇵 `最新` `今日` `ニュース` `天気` `株価` `検索` `調べ`
+- 🇨🇳 `最新` `今天` `搜索` `查一下` `多少钱`
+- 🇬🇧 `latest` `today` `news` `weather` `who is` `what is`
+
+You can also force a search with commands:
+```
+/search Tokyo weather today
+/検索 大阪 ラーメン おすすめ
+/搜索 马斯克最新动态
+```
+
+Search results are injected into the LLM prompt, so the AI can answer with up-to-date information. Powered by self-hosted SearXNG. Aggregates Google, Bing, DuckDuckGo & more — free, unlimited, no API key.
 
 ---
 
@@ -80,7 +107,7 @@ npm start
 
 ### JClawとは？
 
-JClawは、**LINE Messaging API**にネイティブ対応した完全自己ホスト型のオープンソースAIエージェントです。**Ollama**を使ってローカルLLM（例：`qwen3:14b`）をサーバー上で直接実行するため、**APIコスト完全ゼロ**・**外部AIサービス依存なし**・**データ完全ローカル保持**を実現しています。
+JClawは、**LINE Messaging API**にネイティブ対応した完全自己ホスト型のオープンソースAIエージェントです。**Ollama**を使ってローカルLLM（例：`qwen3:14b`）をサーバー上で直接実行するため、**APIコスト完全ゼロ**・**外部AIサービス依存なし**・**データ完全ローカル保持**を実現しています。v1.1より**SearXNG Web検索（自己ホスト型・無料・無制限）**に対応し、最新情報に基づいた回答が可能になりました。
 
 開発・メンテナンス：[iHouse Japan](https://github.com/iHouse-japan)
 
