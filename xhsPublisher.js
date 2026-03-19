@@ -18,6 +18,7 @@ const XHS_PUBLISH_URL = process.env.XHS_PUBLISH_URL || 'https://creator.xiaohong
 const XHS_WINDOW_WIDTH = Number(process.env.XHS_WINDOW_WIDTH || 1000);
 const XHS_WINDOW_HEIGHT = Number(process.env.XHS_WINDOW_HEIGHT || 760);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+const XHS_PUBLISHED_RECORDS = path.join(XHS_ARTIFACTS_DIR, 'published-videos.json');
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -40,8 +41,90 @@ function getLatestVideoFile() {
   return videos[0] || null;
 }
 
+function loadPublishedRecords() {
+  ensureDir(XHS_ARTIFACTS_DIR);
+  if (!fs.existsSync(XHS_PUBLISHED_RECORDS)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(XHS_PUBLISHED_RECORDS, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function savePublishedRecords(records) {
+  ensureDir(XHS_ARTIFACTS_DIR);
+  fs.writeFileSync(XHS_PUBLISHED_RECORDS, JSON.stringify(records, null, 2));
+}
+
+function buildRecordKey(filePath) {
+  const stat = fs.statSync(filePath);
+  return path.basename(filePath) + ':' + stat.size + ':' + stat.mtimeMs;
+}
+
+export function getVideoCatalog() {
+  const published = loadPublishedRecords();
+  const publishedMap = new Map(published.map(record => [record.key, record]));
+  return listVideoFiles(XHS_VIDEO_DIR).map((filePath, index) => {
+    const stat = fs.statSync(filePath);
+    const key = buildRecordKey(filePath);
+    const record = publishedMap.get(key);
+    return {
+      index: index + 1,
+      key,
+      filePath,
+      fileName: path.basename(filePath),
+      size: stat.size,
+      modifiedAt: new Date(stat.mtimeMs).toISOString(),
+      isPublished: !!record,
+      publishCount: record?.publishCount || 0,
+      lastPublishedAt: record?.lastPublishedAt || null,
+      lastTitle: record?.lastTitle || null,
+    };
+  });
+}
+
+function markVideoPublished(videoPath, title, result) {
+  const records = loadPublishedRecords();
+  const key = buildRecordKey(videoPath);
+  const now = new Date().toISOString();
+  const next = [];
+  let updated = false;
+
+  for (const record of records) {
+    if (record.key !== key) {
+      next.push(record);
+      continue;
+    }
+    next.push({
+      ...record,
+      fileName: path.basename(videoPath),
+      filePath: videoPath,
+      publishCount: (record.publishCount || 0) + 1,
+      lastPublishedAt: now,
+      lastTitle: title,
+      lastResult: result,
+    });
+    updated = true;
+  }
+
+  if (!updated) {
+    next.push({
+      key,
+      fileName: path.basename(videoPath),
+      filePath: videoPath,
+      publishCount: 1,
+      lastPublishedAt: now,
+      lastTitle: title,
+      lastResult: result,
+    });
+  }
+
+  savePublishedRecords(next);
+}
+
 export function buildStatus() {
   const latestVideo = getLatestVideoFile();
+  const catalog = getVideoCatalog();
   return {
     publishUrl: XHS_PUBLISH_URL,
     videoDir: XHS_VIDEO_DIR,
@@ -50,6 +133,9 @@ export function buildStatus() {
     defaultTitle: XHS_TITLE,
     latestVideo,
     hasProfile: fs.existsSync(XHS_PROFILE_DIR),
+    totalVideos: catalog.length,
+    publishedVideos: catalog.filter(item => item.isPublished).length,
+    unpublishedVideos: catalog.filter(item => !item.isPublished).length,
   };
 }
 
@@ -148,8 +234,17 @@ export async function loginXiaohongshu() {
   await context.close();
 }
 
-export async function publishLatestVideoTask() {
-  const latestVideo = getLatestVideoFile();
+export async function publishVideoTask(videoPath, title = XHS_TITLE) {
+  if (!videoPath) {
+    throw new Error('未指定要发布的视频。');
+  }
+  if (!fs.existsSync(videoPath)) {
+    throw new Error('视频文件不存在：' + videoPath);
+  }
+  if (!VIDEO_EXTENSIONS.has(path.extname(videoPath).toLowerCase())) {
+    throw new Error('文件不是支持的视频格式：' + videoPath);
+  }
+  const latestVideo = videoPath;
   if (!latestVideo) {
     throw new Error('未找到可发布视频。请把 .mp4/.mov/.m4v/.webm 文件放到 ' + XHS_VIDEO_DIR);
   }
@@ -185,7 +280,7 @@ export async function publishLatestVideoTask() {
       'textarea[placeholder*="标题"]',
       '[contenteditable="true"][data-placeholder*="标题"]',
       'input',
-    ], XHS_TITLE);
+    ], title);
 
     const bodyCandidates = [
       'textarea[placeholder*="描述"]',
@@ -194,7 +289,7 @@ export async function publishLatestVideoTask() {
       '[contenteditable="true"][data-placeholder*="正文"]',
     ];
     try {
-      await tryFill(page, bodyCandidates, XHS_TITLE);
+      await tryFill(page, bodyCandidates, title);
     } catch {}
 
     await page.screenshot({ path: beforeShot, fullPage: true });
@@ -210,17 +305,28 @@ export async function publishLatestVideoTask() {
     await page.waitForTimeout(8000);
     await page.screenshot({ path: afterShot, fullPage: true }).catch(() => {});
 
+    const message = '小红书视频发布流程已执行。';
+    markVideoPublished(latestVideo, title, message);
+
     return {
       success: true,
-      title: XHS_TITLE,
+      title,
       videoPath: latestVideo,
       beforeShot,
       afterShot,
-      message: '小红书视频发布流程已执行。',
+      message,
     };
   } finally {
     await context.close();
   }
+}
+
+export async function publishLatestVideoTask() {
+  const latestVideo = getLatestVideoFile();
+  if (!latestVideo) {
+    throw new Error('未找到可发布视频。请把 .mp4/.mov/.m4v/.webm 文件放到 ' + XHS_VIDEO_DIR);
+  }
+  return publishVideoTask(latestVideo, XHS_TITLE);
 }
 
 async function main() {

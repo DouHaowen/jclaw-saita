@@ -12,7 +12,7 @@ import { messagingApi, middleware, HTTPFetchError } from '@line/bot-sdk';
 import fetch from 'node-fetch';
 import { google } from 'googleapis';
 import dotenv from 'dotenv';
-import { buildStatus as buildXhsStatus, publishLatestVideoTask } from './xhsPublisher.js';
+import { buildStatus as buildXhsStatus, getVideoCatalog, publishLatestVideoTask, publishVideoTask } from './xhsPublisher.js';
 
 dotenv.config();
 
@@ -34,9 +34,21 @@ const MEMCLAWZ_URL = process.env.MEMCLAWZ_URL || 'http://localhost:3500';
 const OWNER_ONLY = process.env.OWNER_ONLY === 'true';
 let OWNER_USER_ID = process.env.OWNER_USER_ID || '';
 const xhsTasks = new Map();
+const xhsSelections = new Map();
 const XHS_PUBLISH_PATTERNS = [
   '发布今天的视频到小红书',
   '发布今天视频到小红书',
+];
+const XHS_PICKER_PATTERNS = [
+  '我要发小红书视频',
+  '我要发布小红书视频',
+  '我想发小红书视频',
+  '发小红书视频',
+  '发布小红书视频',
+  '我要发小红书的视频',
+  '我要发布小红书的视频',
+  '发小红书的视频',
+  '发布小红书的视频',
 ];
 
 function getLLMDisplayName() {
@@ -369,6 +381,69 @@ function getXhsTask(userId) {
   return xhsTasks.get(userId) || null;
 }
 
+function getXhsSelection(userId) {
+  return xhsSelections.get(userId) || null;
+}
+
+function clearXhsSelection(userId) {
+  xhsSelections.delete(userId);
+}
+
+function formatTime(isoString) {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return isoString;
+  return date.toLocaleString('ja-JP', { hour12: false });
+}
+
+function buildVideoCatalogMessage() {
+  const videos = getVideoCatalog();
+  if (!videos.length) {
+    return {
+      videos,
+      text: '📂 当前视频目录里还没有可发布的视频。\n请先把 .mp4/.mov/.m4v/.webm 文件放到服务器的 JClaw 目录里。',
+    };
+  }
+
+  const lines = videos.slice(0, 30).map(video => {
+    const status = video.isPublished
+      ? '已发布' + (video.publishCount > 1 ? ' x' + video.publishCount : '')
+      : '未发布';
+    const publishedAt = video.lastPublishedAt ? '（上次：' + formatTime(video.lastPublishedAt) + '）' : '';
+    return video.index + '. ' + video.fileName + ' — ' + status + publishedAt;
+  });
+
+  const unpublishedCount = videos.filter(video => !video.isPublished).length;
+  const publishedCount = videos.length - unpublishedCount;
+  const prompt = '\n\n回复视频编号或文件名即可开始发布。\n例如：`3` 或 `3.mp4`';
+
+  return {
+    videos,
+    text: '🎬 我找到这些小红书视频：\n\n'
+      + lines.join('\n')
+      + '\n\n未发布：' + unpublishedCount + ' 个'
+      + '\n已发布：' + publishedCount + ' 个'
+      + prompt,
+  };
+}
+
+function resolveSelectedVideo(input, videos) {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  const byIndex = Number.parseInt(trimmed, 10);
+  if (!Number.isNaN(byIndex)) {
+    const match = videos.find(video => video.index === byIndex);
+    if (match) return match;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  return videos.find(video => {
+    const name = video.fileName.toLowerCase();
+    return name === normalized || name.includes(normalized);
+  }) || null;
+}
+
 async function pushText(to, text) {
   console.log('[LINE PUSH] to=' + to.slice(0, 8) + '... text=' + text.slice(0, 120));
   await client.pushMessage({
@@ -377,16 +452,19 @@ async function pushText(to, text) {
   });
 }
 
-async function startXhsVideoPublish(userId) {
+async function startXhsVideoPublish(userId, videoPath = null, title = null) {
   const taskId = Date.now().toString(36);
   xhsTasks.set(userId, {
     taskId,
     status: 'running',
     startedAt: new Date().toISOString(),
+    videoPath,
   });
 
   try {
-    const result = await publishLatestVideoTask();
+    const result = videoPath
+      ? await publishVideoTask(videoPath, title || buildXhsStatus().defaultTitle)
+      : await publishLatestVideoTask();
     xhsTasks.set(userId, {
       taskId,
       status: 'done',
@@ -621,6 +699,7 @@ async function handleEvent(event) {
         + '/search <query> — Web検索\n'
         + '/xhs-video-status — 小红书视频配置状态\n'
         + '发布今天的视频到小红书 — 发布项目目录中最新视频\n'
+        + '我要发小红书视频 — 列出所有视频并让我选择\n'
         + '/reset — 会話リセット\n'
         + '/status — システム状態\n'
         + '/whoami — あなたのID\n'
@@ -635,6 +714,7 @@ async function handleEvent(event) {
 
   if (userText === '/xhs-video-status') {
     const status = buildXhsStatus();
+    const selection = getXhsSelection(userId);
     const task = getXhsTask(userId);
     const taskSummary = task
       ? ('任务状态：' + task.status
@@ -652,8 +732,62 @@ async function handleEvent(event) {
           + '标题：' + status.defaultTitle + '\n'
           + '视频目录：' + status.videoDir + '\n'
           + '最新视频：' + (status.latestVideo || '未找到') + '\n'
+          + '未发布视频：' + status.unpublishedVideos + '\n'
+          + '已发布视频：' + status.publishedVideos + '\n'
           + '登录态目录：' + status.profileDir + '\n'
+          + (selection ? '待选择视频：是\n' : '')
           + taskSummary,
+      }],
+    });
+  }
+
+  if (XHS_PICKER_PATTERNS.includes(userText)) {
+    const catalog = buildVideoCatalogMessage();
+    xhsSelections.set(userId, {
+      createdAt: new Date().toISOString(),
+      videos: catalog.videos,
+    });
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: catalog.text }],
+    });
+  }
+
+  const pendingSelection = getXhsSelection(userId);
+  if (pendingSelection) {
+    const selectedVideo = resolveSelectedVideo(userText, pendingSelection.videos);
+    if (!selectedVideo) {
+      return client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{
+          type: 'text',
+          text: '我没找到你要发布的视频。\n请直接回复视频编号或文件名，例如：`3` 或 `3.mp4`',
+        }],
+      });
+    }
+
+    const currentTask = getXhsTask(userId);
+    if (currentTask?.status === 'running') {
+      return client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '⏳ 小红书视频发布任务已经在执行中，请稍后查看结果。' }],
+      });
+    }
+
+    clearXhsSelection(userId);
+    startXhsVideoPublish(userId, selectedVideo.filePath, buildXhsStatus().defaultTitle).catch(err => {
+      console.error('XHS publish task failed:', err.message);
+    });
+
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{
+        type: 'text',
+        text: '🚀 已开始发布你选择的视频。\n'
+          + '视频：' + selectedVideo.fileName + '\n'
+          + '状态：' + (selectedVideo.isPublished ? '之前发过，当前将再次发布' : '之前未发布') + '\n'
+          + '标题：' + buildXhsStatus().defaultTitle + '\n'
+          + '完成后我会主动发消息告诉你结果。',
       }],
     });
   }
