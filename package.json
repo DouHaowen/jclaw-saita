@@ -6,15 +6,20 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "xhs:login": "node xhsPublisher.js login",
+    "xhs:status": "node xhsPublisher.js status"
   },
   "author": "iHouse Japan",
   "license": "MIT",
   "dependencies": {
     "@line/bot-sdk": "^9.7.0",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2",
     "duck-duck-scrape": "^2.2.5",
-    "node-fetch": "^3.3.2"
+    "express": "^4.21.2",
+    "googleapis": "^150.0.1",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.54.2",
+    "pm2": "^6.0.14"
   }
 }

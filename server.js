@@ -12,6 +12,7 @@ import { messagingApi, middleware, HTTPFetchError } from '@line/bot-sdk';
 import fetch from 'node-fetch';
 import { google } from 'googleapis';
 import dotenv from 'dotenv';
+import { buildStatus as buildXhsStatus, publishLatestVideoTask } from './xhsPublisher.js';
 
 dotenv.config();
 
@@ -21,6 +22,10 @@ const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 };
 
+const LLM_PROVIDER = process.env.LLM_PROVIDER || (process.env.LLM_API_KEY ? 'openai-compatible' : 'ollama');
+const LLM_MODEL = process.env.LLM_MODEL || process.env.OLLAMA_MODEL || 'qwen3:14b';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || process.env.OLLAMA_HOST || 'http://localhost:11434';
+const LLM_API_KEY = process.env.LLM_API_KEY || '';
 const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen3:14b';
 const PORT = process.env.PORT || 3001;
@@ -28,6 +33,52 @@ const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8899';
 const MEMCLAWZ_URL = process.env.MEMCLAWZ_URL || 'http://localhost:3500';
 const OWNER_ONLY = process.env.OWNER_ONLY === 'true';
 let OWNER_USER_ID = process.env.OWNER_USER_ID || '';
+const xhsTasks = new Map();
+const XHS_PUBLISH_PATTERNS = [
+  '发布今天的视频到小红书',
+  '发布今天视频到小红书',
+];
+
+function getLLMDisplayName() {
+  return LLM_PROVIDER + ' (' + LLM_MODEL + ')';
+}
+
+function getOpenAICompatibleBaseUrl(baseUrl) {
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  return trimmed.endsWith('/v1') ? trimmed : trimmed + '/v1';
+}
+
+function parseOpenAICompatibleTextResponse(rawText) {
+  const trimmed = rawText.trim();
+  if (!trimmed) return 'No response';
+
+  if (!trimmed.startsWith('data:')) {
+    const data = JSON.parse(trimmed);
+    return data.choices?.[0]?.message?.content || 'No response';
+  }
+
+  const chunks = trimmed
+    .split(/\n\s*\n|\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith('data:'));
+
+  let content = '';
+  for (const chunk of chunks) {
+    const payload = chunk.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    try {
+      const data = JSON.parse(payload);
+      const deltaText = data.choices?.[0]?.delta?.content;
+      const messageText = data.choices?.[0]?.message?.content;
+      if (typeof deltaText === 'string') content += deltaText;
+      else if (typeof messageText === 'string') content += messageText;
+    } catch (err) {
+      console.error('OpenAI-compatible SSE parse error:', err.message);
+    }
+  }
+
+  return content || 'No response';
+}
 
 // --- Google Workspace Integration (user configures own credentials) ---
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
@@ -314,11 +365,79 @@ function addToHistory(userId, role, content) {
   while (history.length > MAX_HISTORY) history.shift();
 }
 
-// --- Ollama Chat (with Web Search injection) ---
-async function chatWithOllama(userId, userMessage) {
+function getXhsTask(userId) {
+  return xhsTasks.get(userId) || null;
+}
+
+async function pushText(to, text) {
+  console.log('[LINE PUSH] to=' + to.slice(0, 8) + '... text=' + text.slice(0, 120));
+  await client.pushMessage({
+    to,
+    messages: [{ type: 'text', text: text.slice(0, 5000) }],
+  });
+}
+
+async function startXhsVideoPublish(userId) {
+  const taskId = Date.now().toString(36);
+  xhsTasks.set(userId, {
+    taskId,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+  });
+
+  try {
+    const result = await publishLatestVideoTask();
+    xhsTasks.set(userId, {
+      taskId,
+      status: 'done',
+      startedAt: xhsTasks.get(userId)?.startedAt || new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      result,
+    });
+
+    console.log('[XHS] publish success: ' + JSON.stringify(result));
+    await pushText(
+      userId,
+      '✅ 小红书视频发布任务完成\n'
+        + '标题：' + result.title + '\n'
+        + '视频：' + result.videoPath + '\n'
+        + '结果：' + result.message
+    );
+  } catch (err) {
+    xhsTasks.set(userId, {
+      taskId,
+      status: 'failed',
+      startedAt: xhsTasks.get(userId)?.startedAt || new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      error: err.message,
+    });
+
+    console.error('[XHS] publish failed:', err.message);
+    await pushText(
+      userId,
+      '❌ 小红书视频发布失败\n'
+        + '原因：' + err.message + '\n'
+        + '如果是首次使用，请先在 Mac mini 上执行 `npm run xhs:login` 完成一次登录。'
+    );
+  }
+}
+
+function buildRuntimeIdentityPrompt() {
+  return [
+    '【运行时身份锁定】',
+    '你对外的产品身份始终是 JClaw，不是 Claude、Anthropic、OpenAI、ChatGPT 或其他平台助手。',
+    '无论底层推理模型或 API 提供方是什么，你都必须先以 JClaw 的身份回答，并遵守上面的系统设定、功能边界、链接、搜索和记忆规则。',
+    '如果用户问“你是谁”“介绍一下自己”“你能做什么”，你应该把自己介绍为 JClaw，并基于当前系统设定说明功能。',
+    '如果用户明确问“你是什么模型”，你可以说明：你是 JClaw，目前底层运行模型是 ' + LLM_MODEL + '，通过 ' + LLM_PROVIDER + ' 提供。',
+    '不要把 API 提供方的默认身份、默认公司名、默认产品名当成你自己的身份。',
+    '如果系统设定和底层模型自带偏好冲突，以系统设定为准。',
+  ].join('\n');
+}
+
+async function chatWithLLM(userId, userMessage) {
   addToHistory(userId, 'user', userMessage);
 
-  let systemContent = SYSTEM_PROMPT;
+  let systemContent = SYSTEM_PROMPT + '\n\n' + buildRuntimeIdentityPrompt();
 
   // Long-term memory recall
   const memories = await memorySearch(userMessage, userId);
@@ -349,39 +468,68 @@ async function chatWithOllama(userId, userMessage) {
   ];
 
   try {
-    const response = await fetch(OLLAMA_HOST + '/api/chat', {
+    const isOpenAICompatible = LLM_PROVIDER === 'openai-compatible';
+    const requestUrl = isOpenAICompatible
+      ? getOpenAICompatibleBaseUrl(LLM_BASE_URL) + '/chat/completions'
+      : LLM_BASE_URL.replace(/\/+$/, '') + '/api/chat';
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (isOpenAICompatible && LLM_API_KEY) {
+      headers.Authorization = 'Bearer ' + LLM_API_KEY;
+    }
+
+    const payload = isOpenAICompatible
+      ? {
+          model: LLM_MODEL,
+          messages,
+          temperature: 0.7,
+          max_tokens: 1024,
+          stream: false,
+        }
+      : {
+          model: LLM_MODEL,
+          messages,
+          stream: false,
+          options: { temperature: 0.7, num_predict: 1024 },
+        };
+
+    const response = await fetch(requestUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        messages,
-        stream: false,
-        options: { temperature: 0.7, num_predict: 1024 },
-      }),
+      headers,
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(90000),
     });
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error('Ollama error ' + response.status + ': ' + errText);
+      console.error('LLM error ' + response.status + ': ' + errText);
       return 'AI処理エラー (' + response.status + ')';
     }
 
-    const data = await response.json();
-    let reply = data.message?.content || 'No response';
+    const rawText = await response.text();
+    let reply;
+    let data = null;
+
+    if (isOpenAICompatible) {
+      reply = parseOpenAICompatibleTextResponse(rawText);
+    } else {
+      data = JSON.parse(rawText);
+      reply = data.message?.content || 'No response';
+    }
+
     reply = reply.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
     addToHistory(userId, 'assistant', reply);
 
     // Save conversation to long-term memory (async, non-blocking)
     memorySave('User: ' + userMessage + '\nAssistant: ' + reply.substring(0, 500), userId, 'event').catch(() => {});
 
-    if (data.eval_count && data.eval_duration) {
+    if (data?.eval_count && data?.eval_duration) {
       const tps = (data.eval_count / (data.eval_duration / 1e9)).toFixed(1);
-      console.log('[' + OLLAMA_MODEL + '] ' + data.eval_count + ' tokens @ ' + tps + ' t/s');
+      console.log('[' + LLM_MODEL + '] ' + data.eval_count + ' tokens @ ' + tps + ' t/s');
     }
     return reply;
   } catch (err) {
-    console.error('Ollama request failed:', err.message);
+    console.error('LLM request failed:', err.message);
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       return 'AIの応答がタイムアウトしました。もう一度お試しください。';
     }
@@ -435,11 +583,13 @@ async function handleEvent(event) {
   // /status command
   if (userText === '/status') {
     const history = getHistory(userId);
+    const xhsTask = getXhsTask(userId);
     const statusText = '📊 JClaw v2.0 Status\n\n'
-      + '🦙 Model: ' + OLLAMA_MODEL + '\n'
+      + '🧠 LLM: ' + getLLMDisplayName() + '\n'
       + '🧠 Memory: Tier S (memclawz v9.1)\n'
       + '   Qdrant + Neo4j Knowledge Graph\n'
       + '🔍 Search: SearXNG (self-hosted, free)\n'
+      + '🎬 XHS Video: ' + (xhsTask ? xhsTask.status : 'idle') + '\n'
       + '💬 History: ' + history.length + '/' + MAX_HISTORY + ' turns\n'
       + '🔒 Mode: Owner Only\n\n'
       + '🌐 Links:\n'
@@ -469,6 +619,8 @@ async function handleEvent(event) {
         + '/search /検索 /搜索 で直接検索も可。\n\n'
         + '━━━ ⚙️ コマンド ━━━\n'
         + '/search <query> — Web検索\n'
+        + '/xhs-video-status — 小红书视频配置状态\n'
+        + '发布今天的视频到小红书 — 发布项目目录中最新视频\n'
         + '/reset — 会話リセット\n'
         + '/status — システム状態\n'
         + '/whoami — あなたのID\n'
@@ -481,8 +633,57 @@ async function handleEvent(event) {
     });
   }
 
+  if (userText === '/xhs-video-status') {
+    const status = buildXhsStatus();
+    const task = getXhsTask(userId);
+    const taskSummary = task
+      ? ('任务状态：' + task.status
+        + (task.startedAt ? '\n开始时间：' + task.startedAt : '')
+        + (task.finishedAt ? '\n结束时间：' + task.finishedAt : '')
+        + (task.result?.message ? '\n结果：' + task.result.message : '')
+        + (task.result?.videoPath ? '\n发布视频：' + task.result.videoPath : '')
+        + (task.error ? '\n错误：' + task.error : ''))
+      : '任务状态：idle';
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{
+        type: 'text',
+        text: '🎬 小红书视频发布状态\n\n'
+          + '标题：' + status.defaultTitle + '\n'
+          + '视频目录：' + status.videoDir + '\n'
+          + '最新视频：' + (status.latestVideo || '未找到') + '\n'
+          + '登录态目录：' + status.profileDir + '\n'
+          + taskSummary,
+      }],
+    });
+  }
+
+  if (userText === '/xhs-video-publish' || XHS_PUBLISH_PATTERNS.includes(userText)) {
+    const currentTask = getXhsTask(userId);
+    if (currentTask?.status === 'running') {
+      return client.replyMessage({
+        replyToken: event.replyToken,
+        messages: [{ type: 'text', text: '⏳ 小红书视频发布任务已经在执行中，请稍后查看结果。' }],
+      });
+    }
+
+    startXhsVideoPublish(userId).catch(err => {
+      console.error('XHS publish task failed:', err.message);
+    });
+
+    return client.replyMessage({
+      replyToken: event.replyToken,
+      messages: [{
+        type: 'text',
+        text: '🚀 已开始执行小红书视频发布任务。\n'
+          + '我会读取项目目录中的最新视频，并使用固定标题“日本后继无人的优良企业”执行发布。\n'
+          + '完成后我会再发消息告诉你结果。',
+      }],
+    });
+  }
+
   console.log('[' + userId.slice(0,8) + '...] ' + userText);
-  const aiReply = await chatWithOllama(userId, userText);
+  const aiReply = await chatWithLLM(userId, userText);
 
   const messages = [];
   if (aiReply.length <= 5000) {
@@ -502,10 +703,14 @@ const app = express();
 
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok', model: OLLAMA_MODEL, ollama: OLLAMA_HOST,
+    status: 'ok',
+    provider: LLM_PROVIDER,
+    model: LLM_MODEL,
+    llmBaseUrl: LLM_BASE_URL,
     uptime: process.uptime(), conversations: conversations.size,
     webSearch: 'enabled (SearXNG self-hosted, free, unlimited)',
     memory: 'enabled (memclawz v9.1, Qdrant + Neo4j)',
+    xiaohongshuVideo: buildXhsStatus(),
   });
 });
 
@@ -533,7 +738,7 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log('='.repeat(50));
   console.log('🐾 JClaw v2.0 is running on port ' + PORT);
-  console.log('🦙 Ollama: ' + OLLAMA_HOST + ' (' + OLLAMA_MODEL + ')');
+  console.log('🧠 LLM: ' + getLLMDisplayName() + ' @ ' + LLM_BASE_URL);
   console.log('🔍 Web Search: SearXNG (self-hosted, free, unlimited)');
   console.log('🧠 Memory: memclawz v9.1 (Qdrant + Neo4j, zero API cost)');
   console.log('📡 Webhook: http://localhost:' + PORT + '/webhook');

@@ -80,9 +80,19 @@ docker compose up -d searxng
 docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
 docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=none neo4j:5-community
 
-# Pull LLM model & launch
+# Pull local LLM model & launch
 ollama pull qwen3:14b && npm start
 # 🐾 JClaw v2.1 running — Tier S memory + Owner mode enabled
+```
+
+For OpenAI-compatible APIs, set these in `.env` instead of relying on local Ollama:
+
+```bash
+LLM_PROVIDER=openai-compatible
+LLM_BASE_URL=https://api.ihousejapan.cn
+LLM_MODEL=your-model-name
+LLM_API_KEY=sk-xxxx
+npm start
 ```
 
 ## Environment Variables
@@ -91,6 +101,10 @@ ollama pull qwen3:14b && npm start
 |----------|-------------|---------|
 | `LINE_CHANNEL_SECRET` | LINE channel secret (required) | — |
 | `LINE_CHANNEL_ACCESS_TOKEN` | LINE access token (required) | — |
+| `LLM_PROVIDER` | `ollama` or `openai-compatible` | `ollama` |
+| `LLM_BASE_URL` | LLM API base URL | `http://localhost:11434` |
+| `LLM_MODEL` | LLM model name | `qwen3:14b` |
+| `LLM_API_KEY` | API key for OpenAI-compatible providers | — |
 | `OLLAMA_HOST` | Ollama API URL | `http://localhost:11434` |
 | `OLLAMA_MODEL` | LLM model name | `qwen3:14b` |
 | `PORT` | Server port | `3001` |
